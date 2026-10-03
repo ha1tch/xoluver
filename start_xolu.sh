@@ -1,0 +1,1 @@
+XOLU_PORT=9090 XOLU_BASE_DIR=/tmp/xolu-data XOLU_API_V2_ENABLED=true XOLU_AUTH_TYPE=none ./xolu
