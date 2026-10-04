@@ -140,6 +140,32 @@ func ExampleClient_AsOf() {
 	}
 }
 
+func ExampleClient_UseTimeIndex() {
+	ctx := context.Background()
+	c := xoluver.New("http://localhost:9091")
+	c.Tenant = "acme" // /ts is served only on tenant routes
+
+	// Once: provision /ts and define timeline 7 (two dimensions, no expiry).
+	if err := c.DefineTimeIndex(ctx, 7); err != nil {
+		return
+	}
+	// From then on, saves of "asset" entities write one index event per history
+	// row, and AsOf is answered from the index when it can be verified.
+	if err := c.UseTimeIndex("asset", 7); err != nil {
+		return
+	}
+	ref := xoluver.EntityRef{Type: "asset", ID: 123}
+
+	// History that predates the index: see what is missing, then write it.
+	rep, _ := c.CheckIndex(ctx, ref)
+	if !rep.OK() {
+		n, _ := c.RebuildIndex(ctx, ref)
+		fmt.Println("missing", rep.Missing, "- wrote", n, "events")
+	}
+	hits, fallbacks := c.IndexStats()
+	fmt.Println(hits, "calls answered from the index,", fallbacks, "left it")
+}
+
 func ExampleClient_CheckHistory() {
 	ctx := context.Background()
 	c := xoluver.New("http://localhost:9090")

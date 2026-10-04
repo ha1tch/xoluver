@@ -2,6 +2,8 @@
 
 xoluver keeps a full history of every change to an entity stored in xolu. Each save writes the new document and a snapshot of it in one step, so you can list versions, read an old one, restore it, or name one ("published").
 
+This is the usage guide. The [README](README.md) is the reference, [docs/FSM_AND_TS.md](docs/FSM_AND_TS.md) covers the two optional features (the /fsm lifecycle step and the /ts version index) and what they cost, and [docs/DESIGN.md](docs/DESIGN.md) explains the design. The README has a map of which document answers which question.
+
 ## Before you start
 
 - A xolu server on the SQLite backend, with `XOLU_API_V2_ENABLED=true` (labels use `/meta`).
@@ -180,6 +182,10 @@ Leave `Walk` nil and no state machine is touched. xolu does not check that the m
 | `*ErrDeletedAsOf` | `AsOf`: the entity did not exist at that instant; it had been deleted | Use `DeletedAt` |
 | `*ErrBeforeHistory` | `AsOf`: no record at that instant; the history starts later | Use `Since`; do not read it as "did not exist" |
 | `ErrNoHistory` | `AsOf`: nothing is recorded for the entity | Nothing can be said about any time |
+| `ErrTenantOQL` | The read needs OQL and `Client.Tenant` is set; xolu cannot run OQL over tenant entities | Use `AsOf` with a version index, or `CheckIndex` and `RebuildIndex` |
+| `ErrTenantRequired` | A version index is configured and `Client.Tenant` is not | Set `Tenant`; /ts is served only on tenant routes |
+| `*ErrIndexNotReady` | The index timeline is not defined; nothing was written | `DefineTimeIndex` |
+| `ErrNoIndex` | `CheckIndex` or `RebuildIndex` for a type with no index | `UseTimeIndex` |
 | `*ErrDocumentTooLarge` | The save would exceed the request limit | Shrink the document |
 | `*ErrLifecycleRejected` | The state-machine transition was refused; nothing saved | Fix the input or payload |
 | `*ErrEntityRecreated` | The entity was deleted during the save and xolu recreated it | Rare; run `CheckHistory` and repair |
@@ -224,6 +230,7 @@ Each runs like the quickstart: `XOLU_URL=http://localhost:9090 go run ./examples
 | `lifecycle` | A save that moves a state machine, and a refused transition that leaves nothing behind (needs `XOLU_API_V2_ENABLED=true`) |
 | `bypass` | What happens when something writes around xoluver, and how `CheckHistory` reports it |
 | `timemachine` | What an entity looked like at earlier instants with `AsOf`, and the three kinds of "no" |
+| `timeindex` | The optional version index: `AsOf` answered from /ts, and a rebuild for history that predates it (needs a tenant-and-timeseries xolu: see the README) |
 
 `diff` prints:
 
@@ -247,6 +254,76 @@ after two plain writes and a save:           ok=false entity at v7, history has 
 ```
 
 The examples share `examples/internal/demo`, a few plain-HTTP helpers that create and read the live entity, so each example stays short.
+
+## Make AsOf faster with the version index (optional)
+
+Without an index, `AsOf` makes xolu read every row of the history type. With one, it reads only that entity's /ts events. Set it up once, per entity type:
+
+```go
+c.Tenant = "acme"                    // /ts is served only on tenant routes
+err := c.DefineTimeIndex(ctx, 7)     // provision /ts and define timeline 7 (no expiry)
+err = c.UseTimeIndex("asset", 7)     // index entities of type "asset" in timeline 7
+```
+
+After that, `Save`, `Restore` and `Delete` write one index event per history row, in the same commit, and `AsOf` uses them. You do not change how you call `AsOf`: it checks the index against the history and falls back to the scan whenever it cannot trust it, so the answers are the same. `c.IndexStats()` tells you how often each happened.
+
+History that existed before the index is not indexed. `c.CheckIndex(ctx, ref)` shows what is missing, and `c.RebuildIndex(ctx, ref)` writes it. `examples/timeindex` shows the whole sequence.
+
+On xolu v0.30.38, tenant routes cannot run OQL, so on them `AsOf` without a usable index, `ListVersions` and `CheckHistory` return `ErrTenantOQL`. The README explains this and lists what works.
+
+## Should I use /fsm or /ts?
+
+They are independent options and answer different questions: /fsm decides whether a change may happen and keeps the entity's state (writes only), and /ts makes `AsOf` fast on a large history (writes and reads). On the machine I measured, a walk added about 25 to 30% to a save and the index about 44%, while `AsOf` stayed near 1 ms as the history type grew to 50,000 rows and the scan reached 124 ms. [docs/FSM_AND_TS.md](docs/FSM_AND_TS.md) has the setup, the rules for using each correctly, the full measurements and a table for choosing, and `examples/benchmark` reruns the measurements on your own system.
+
+## Worked examples with the version index
+
+These five need a xolu that serves /ts on tenant routes. Start one, then run any of them:
+
+```bash
+XOLU_PORT=9091 XOLU_BASE_DIR=/tmp/xolu-ts XOLU_API_V2_ENABLED=true XOLU_AUTH_TYPE=none \
+  XOLU_TIMESERIES_ENABLED=true XOLU_TENANT_AUTO_REGISTER=true ./xolu
+XOLU_URL=http://localhost:9091 XOLU_TENANT=acme go run ./examples/pointintime
+```
+
+| Example | Scenario | What it shows |
+|---------|----------|---------------|
+| `pointintime` | A month-end report: five assets, three month-ends | One `AsOf` per cell, every one answered from the index. The three kinds of "no" stay separate in the report, plus "not indexed" for an entity the index knows nothing about |
+| `windowdiff` | "What changed between these two instants?" | Eight windows, each a different pair of answers. A first record is reported as a first record, never as a creation |
+| `restoreasof` | "Put it back the way it was at 14:00" | `AsOf` finds the version in effect then, `Restore` saves it as a new version. Before the first record and after a deletion there is nothing to restore, and it says why |
+| `contention` | Four writers incrementing one counter | Colliding commits (27 to 29 per run in my runs) were rejected and retried; the index still has exactly one event per version, and `AsOf` at each version's own instant returns that version |
+| `indexmaint` | A maintenance job over seven assets | `CheckIndex` on each, `RebuildIndex` where events are missing, and a report of what only an administrator can fix |
+
+`pointintime` prints, the same every run:
+
+```
+asset   Jan 31        Feb 28        Mar 31
+pump-1  active        maintenance   active
+pump-2  active        deleted       deleted
+pump-3  no record     no record     active
+pump-4  fault         active        active
+pump-5  not indexed   not indexed   not indexed
+
+12 of 15 lookups were answered from the index; 3 left it
+```
+
+`pump-3` has no record before March because xoluver first saw it then: that is not "did not exist". `pump-2` is "deleted" because a tombstone proves it. `pump-5` was never saved through xoluver, so the index holds nothing, and on tenant routes xoluver will not scan.
+
+`indexmaint` prints, the same every run (it shows labels, not ids):
+
+```
+asset  before                         action           after
+a1     ok                             -                ok
+a2     ok                             -                ok
+b1     missing [1 2 3]                wrote 3 events   ok
+b2     missing [1 2 3]                wrote 3 events   ok
+c1     orphans [99]                   -                orphans [99]
+d1     duplicates [2]                 -                duplicates [2]
+e1     missing [1 3]; mismatched [2]  wrote 2 events   mismatched [2]
+
+4 of 7 healthy after maintenance; 3 need an administrator.
+```
+
+`RebuildIndex` only adds events. xolu removes /ts events only by time-range purge, so orphans, duplicates and wrong times are reported, not repaired. `contention` varies in its retry count only (27 to 29 in my runs).
 
 ## The library's own version
 

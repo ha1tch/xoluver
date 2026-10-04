@@ -368,6 +368,7 @@ func TestClockSkewIsReportedLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	slow := New(c.BaseURL)
+	slow.Tenant = c.Tenant
 	slow.Now = func() time.Time { return base.Add(-4 * time.Second) } // a writer whose clock is behind
 	if _, err := slow.Save(ctx, ref, 2, map[string]any{"n": 3}, SaveOptions{SavedBy: "slow clock"}); err != nil {
 		t.Fatal(err)

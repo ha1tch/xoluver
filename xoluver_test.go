@@ -32,6 +32,16 @@ func testClient(t *testing.T) *Client {
 	return New(u)
 }
 
+// apiPath is the path a request for p takes with c's tenant setting, for tests
+// that proxy live traffic and recognise requests by path.
+func apiPath(c *Client, p string) string {
+	r, err := c.route(p)
+	if err != nil {
+		panic(err)
+	}
+	return r
+}
+
 func uniqueType(prefix string) string {
 	return prefix + "_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 }

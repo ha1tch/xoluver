@@ -6,4 +6,4 @@ package xoluver
 
 // Version is the xoluver library version. `repoman syncver` keeps it in step
 // with the VERSION file; do not edit it by hand.
-const Version = "0.1.0"
+const Version = "0.2.0"

@@ -201,13 +201,13 @@ func TestNotFoundErrorsAreDistinctAndShareAParent(t *testing.T) {
 
 // ---- live server -----------------------------------------------------------
 
-func failFirstDelete(t *testing.T, upstream, typ string, id int) *httptest.Server {
+func failFirstDelete(t *testing.T, c0 *Client, typ string, id int) *httptest.Server {
 	t.Helper()
-	up, _ := url.Parse(upstream)
+	up, _ := url.Parse(c0.BaseURL)
 	proxy := httputil.NewSingleHostReverseProxy(up)
 	var failed int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete && r.URL.Path == fmt.Sprintf("/api/v1/%s/%d", typ, id) && atomic.CompareAndSwapInt32(&failed, 0, 1) {
+		if r.Method == http.MethodDelete && r.URL.Path == apiPath(c0, fmt.Sprintf("/api/v1/%s/%d", typ, id)) && atomic.CompareAndSwapInt32(&failed, 0, 1) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprint(w, `{"error":{"code":"XOLU-ST999","message":"injected failure","status":500}}`)
@@ -328,7 +328,8 @@ func TestInterruptedDeleteIsVisibleAndRecoverable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := New(failFirstDelete(t, c0.BaseURL, typ, id).URL)
+	c := New(failFirstDelete(t, c0, typ, id).URL)
+	c.Tenant = c0.Tenant
 	_, err := c.Delete(ctx, ref, 2, SaveOptions{SavedBy: "alice"})
 	var inc *ErrDeleteIncomplete
 	if !errors.As(err, &inc) || inc.Version != 3 {

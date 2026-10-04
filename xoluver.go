@@ -22,12 +22,14 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 var (
-	typeRe  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,50}$`)
-	labelRe = regexp.MustCompile(`^[a-zA-Z0-9_]{1,57}$`) // "label_" prefix keeps the key within xolu's 64-char limit
+	typeRe   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,50}$`)
+	labelRe  = regexp.MustCompile(`^[a-zA-Z0-9_]{1,57}$`) // "label_" prefix keeps the key within xolu's 64-char limit
+	tenantRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 )
 
 const (
@@ -81,6 +83,19 @@ type Client struct {
 	// Saves that would exceed it fail locally with ErrDocumentTooLarge instead
 	// of reaching xolu, which answers 400 "Invalid JSON" for an oversize body.
 	MaxCommitBytes int
+
+	// Tenant, when set, sends every request to xolu's tenant routes
+	// (/api/v1/tenant/<Tenant>/... and /api/v2/tenant/<Tenant>/...). The version
+	// index needs it, because xolu serves /ts only there.
+	Tenant string
+
+	// TimeIndex maps an entity type to the id of the /ts timeline that indexes its
+	// versions. Set it with UseTimeIndex, before the client is shared between
+	// goroutines.
+	TimeIndex map[string]int
+
+	indexHits      int64 // AsOf answers served from the index
+	indexFallbacks int64 // AsOf calls that left the index and used the scan
 }
 
 // New returns a Client for the given base URL, e.g. "http://localhost:9090".
@@ -417,9 +432,18 @@ func (c *Client) finishDelete(ctx context.Context, ref EntityRef, version int, w
 }
 
 type commitReq struct {
-	Update  commitUpdate   `json:"update"`
-	Append  []commitAppend `json:"append"`
-	FsmWalk *commitWalk    `json:"fsm_walk,omitempty"` // nil pointer: field omitted entirely
+	Update     commitUpdate   `json:"update"`
+	Append     []commitAppend `json:"append"`
+	FsmWalk    *commitWalk    `json:"fsm_walk,omitempty"`   // nil pointer: field omitted entirely
+	Timeseries []commitTS     `json:"timeseries,omitempty"` // only when a time index is configured for the type
+}
+
+// commitTS is one /ts event written in the same /commit.
+type commitTS struct {
+	Timeline int       `json:"timeline"`
+	Dims     []uint64  `json:"dims"`
+	Time     string    `json:"time"`
+	Nums     []float64 `json:"nums,omitempty"`
 }
 
 type commitWalk struct {
@@ -477,6 +501,10 @@ func (c *Client) save(ctx context.Context, ref EntityRef, base int, doc map[stri
 		lifecycleInput = opt.Walk.Input
 	}
 	newDoc := stripSystem(doc)
+	at := c.Now() // one instant for every row and index event this save writes
+	if _, indexed := c.TimeIndex[ref.Type]; indexed && c.Tenant == "" {
+		return SaveResult{}, ErrTenantRequired
+	}
 
 	// Look at the entity first. A missing entity must not be saved: xolu's
 	// compare-and-set creates it instead of failing (see ErrEntityRecreated).
@@ -503,14 +531,15 @@ func (c *Client) save(ctx context.Context, ref EntityRef, base int, doc map[stri
 		return SaveResult{}, ErrDeleted
 	}
 	if !has {
-		appends = append(appends, c.historyRow(ref, base, ChangeBaseline, cur, opt, 0, ""))
+		appends = append(appends, c.historyRow(ref, base, ChangeBaseline, cur, opt, 0, "", at))
 	}
-	appends = append(appends, c.historyRow(ref, base+1, kind, newDoc, opt, restoredFrom, lifecycleInput))
+	appends = append(appends, c.historyRow(ref, base+1, kind, newDoc, opt, restoredFrom, lifecycleInput, at))
 
 	req := commitReq{
-		Update:  commitUpdate{Entity: ref.Type, ID: ref.ID, Version: base, Data: newDoc},
-		Append:  appends,
-		FsmWalk: walk,
+		Update:     commitUpdate{Entity: ref.Type, ID: ref.ID, Version: base, Data: newDoc},
+		Append:     appends,
+		FsmWalk:    walk,
+		Timeseries: c.timeIndexEvents(ref, at, appends),
 	}
 	if err := c.checkSize(req); err != nil {
 		return SaveResult{}, err
@@ -533,6 +562,9 @@ func (c *Client) save(ctx context.Context, ref EntityRef, base int, doc map[stri
 					return SaveResult{}, &ErrVersionConflict{Current: cur}
 				}
 				return SaveResult{}, &ErrCorruptHistory{Version: base + 1, Rows: 1}
+			case ae.Code == "XOLU-CM012":
+				// The index timeline is not defined (or the tenant is not provisioned).
+				return SaveResult{}, &ErrIndexNotReady{Type: ref.Type, Timeline: c.TimeIndex[ref.Type]}
 			case ae.Code == "XOLU-FSM008":
 				return SaveResult{}, &ErrLifecycleRejected{Code: ae.Code, Message: ae.Message}
 			}
@@ -577,14 +609,14 @@ func (c *Client) checkSize(req commitReq) error {
 	return nil
 }
 
-func (c *Client) historyRow(ref EntityRef, version int, kind string, snapshot map[string]any, opt SaveOptions, restoredFrom int, lifecycleInput string) commitAppend {
+func (c *Client) historyRow(ref EntityRef, version int, kind string, snapshot map[string]any, opt SaveOptions, restoredFrom int, lifecycleInput string, at time.Time) commitAppend {
 	data := map[string]any{
 		"entity_id":   ref.ID,
 		"version":     version,
 		"snapshot":    snapshot,
 		"change_kind": kind,
 		"saved_by":    opt.SavedBy,
-		"saved_at":    FormatTime(c.Now()),
+		"saved_at":    FormatTime(at),
 	}
 	if opt.Reason != "" {
 		data["reason"] = opt.Reason
@@ -596,6 +628,31 @@ func (c *Client) historyRow(ref EntityRef, version int, kind string, snapshot ma
 		data["lifecycle_input"] = lifecycleInput
 	}
 	return commitAppend{Entity: ref.historyType(), ID: historyID(ref.ID, version), Data: data}
+}
+
+// timeIndexEvents returns the /ts events that index the history rows being
+// written, or nil when the entity type has no version index. Each event has
+// the dimensions (entity id, version), the same instant as the row's saved_at,
+// and one number: 1 for a tombstone, 0 for every other row.
+func (c *Client) timeIndexEvents(ref EntityRef, at time.Time, rows []commitAppend) []commitTS {
+	timeline, ok := c.TimeIndex[ref.Type]
+	if !ok {
+		return nil
+	}
+	out := make([]commitTS, 0, len(rows))
+	for _, r := range rows {
+		kind := 0.0
+		if r.Data["change_kind"] == ChangeDelete {
+			kind = 1
+		}
+		out = append(out, commitTS{
+			Timeline: timeline,
+			Dims:     []uint64{uint64(ref.ID), uint64(asInt(r.Data["version"]))},
+			Time:     at.UTC().Format(time.RFC3339Nano),
+			Nums:     []float64{kind},
+		})
+	}
+	return out
 }
 
 // ---- Reads -----------------------------------------------------------------
@@ -742,22 +799,28 @@ func (e *ErrDeletedAsOf) Error() string {
 // AsOf shows only states that went through Save, Restore and Delete. A write
 // that skipped them leaves no row, and CheckHistory reports such gaps.
 //
-// It reads the summaries of the entity's history (OQL scans the whole history
-// type), then one row by id.
+// Without a time index it reads the summaries of the entity's history (OQL
+// scans the whole history type), then one row by id. With one (UseTimeIndex) it
+// reads the entity's index events instead, checks them against the history rows
+// (nothing missing at the start, in a gap or at the end; no duplicate; the row
+// the answer names), and falls back to the scan whenever the index cannot be
+// trusted, so the answer is the same either way.
 func (c *Client) AsOf(ctx context.Context, ref EntityRef, t time.Time) (VersionRecord, error) {
 	if err := ref.validate(); err != nil {
 		return VersionRecord{}, err
+	}
+	if timeline, ok := c.TimeIndex[ref.Type]; ok {
+		if rec, trusted, err := c.asOfIndexed(ctx, ref, timeline, t); trusted {
+			atomic.AddInt64(&c.indexHits, 1)
+			return rec, err
+		}
+		atomic.AddInt64(&c.indexFallbacks, 1)
 	}
 	rows, err := c.historyRows(ctx, ref)
 	if err != nil {
 		return VersionRecord{}, err
 	}
-	type entry struct {
-		version int
-		kind    string
-		at      time.Time
-	}
-	var seq []entry
+	var seq []asOfEntry
 	for _, r := range rows {
 		v := asInt(r["version"])
 		if asInt(r["id"]) != historyID(ref.ID, v) {
@@ -767,13 +830,30 @@ func (c *Client) AsOf(ctx context.Context, ref EntityRef, t time.Time) (VersionR
 		if err != nil {
 			return VersionRecord{}, &ErrCorruptHistory{Version: v, Rows: 1}
 		}
-		seq = append(seq, entry{version: v, kind: asString(r["change_kind"]), at: at})
+		seq = append(seq, asOfEntry{version: v, kind: asString(r["change_kind"]), at: at})
 	}
 	if len(seq) == 0 {
 		return VersionRecord{}, ErrNoHistory
 	}
 	sort.Slice(seq, func(i, j int) bool { return seq[i].version < seq[j].version })
+	last := asOfWalk(seq, t)
+	if err := asOfFailure(seq, last, t); err != nil {
+		return VersionRecord{}, err
+	}
+	return c.GetVersion(ctx, ref, seq[last].version)
+}
 
+// asOfEntry is one version of the history as AsOf sees it: its time and kind.
+type asOfEntry struct {
+	version int
+	kind    string
+	at      time.Time
+}
+
+// asOfWalk applies the AsOf rule to a version-ordered sequence: walk it and
+// stop at the first entry saved after t. It returns the index of the last entry
+// visited, or -1 if the first entry is already after t.
+func asOfWalk(seq []asOfEntry, t time.Time) int {
 	last := -1
 	for i, e := range seq {
 		if e.at.After(t) {
@@ -781,13 +861,473 @@ func (c *Client) AsOf(ctx context.Context, ref EntityRef, t time.Time) (VersionR
 		}
 		last = i
 	}
+	return last
+}
+
+// asOfFailure returns the answer that is not a record: ErrBeforeHistory when
+// the walk visited nothing, ErrDeletedAsOf when it ended on a tombstone, nil
+// when seq[last] is a record.
+func asOfFailure(seq []asOfEntry, last int, t time.Time) error {
 	switch {
 	case last < 0:
-		return VersionRecord{}, &ErrBeforeHistory{At: t.UTC(), Since: seq[0].at, SinceVersion: seq[0].version}
+		return &ErrBeforeHistory{At: t.UTC(), Since: seq[0].at, SinceVersion: seq[0].version}
 	case seq[last].kind == ChangeDelete:
-		return VersionRecord{}, &ErrDeletedAsOf{At: t.UTC(), DeletedAt: seq[last].at, Version: seq[last].version}
+		return &ErrDeletedAsOf{At: t.UTC(), DeletedAt: seq[last].at, Version: seq[last].version}
 	}
-	return c.GetVersion(ctx, ref, seq[last].version)
+	return nil
+}
+
+const (
+	// indexPageMax is the most events one /ts query returns. An entity whose
+	// index reaches it is not answered from the index.
+	indexPageMax = 10000
+	// maxGapChecks bounds the history rows AsOf reads to confirm that the gaps
+	// in the index are gaps in the history too.
+	maxGapChecks = 64
+)
+
+type indexEvent struct {
+	Dims []uint64  `json:"dims"`
+	Time string    `json:"time"`
+	Nums []float64 `json:"nums"`
+}
+
+// asOfIndexed answers from the version index. trusted is false when the index
+// cannot be relied on for this call, and the caller then uses the scan. When
+// trusted is true the answer is exactly what the scan would give: the index is
+// derived data, checked against the history rows it names.
+func (c *Client) asOfIndexed(ctx context.Context, ref EntityRef, timeline int, t time.Time) (rec VersionRecord, trusted bool, err error) {
+	seq, ok := c.indexSeq(ctx, ref, timeline)
+	if !ok || !c.indexComplete(ctx, ref, seq) {
+		return VersionRecord{}, false, nil
+	}
+	last := asOfWalk(seq, t)
+	failure := asOfFailure(seq, last, t)
+
+	// What the answer names, and the entry that ended the walk, must exist in
+	// the history and agree with the index. The times of the entries before
+	// them are trusted here; CheckIndex verifies every event.
+	named := seq[0]
+	if last >= 0 {
+		named = seq[last]
+	}
+	row, err := c.GetVersion(ctx, ref, named.version)
+	if errors.Is(err, ErrVersionNotFound) {
+		return VersionRecord{}, false, nil // an event with no row behind it
+	}
+	if err != nil {
+		return VersionRecord{}, true, err // for example ErrCorruptHistory, as the scan would say
+	}
+	if !agrees(row, named) {
+		return VersionRecord{}, false, nil
+	}
+	if last >= 0 && last+1 < len(seq) {
+		next := seq[last+1]
+		if nrow, err := c.GetVersion(ctx, ref, next.version); err != nil || !agrees(nrow, next) {
+			return VersionRecord{}, false, nil
+		}
+	}
+	if failure != nil {
+		return VersionRecord{}, true, failure
+	}
+	return row, true, nil
+}
+
+// agrees reports whether a history row has the time and kind its index event says.
+func agrees(row VersionRecord, e asOfEntry) bool {
+	return row.SavedAt == FormatTime(e.at) && (row.ChangeKind == ChangeDelete) == (e.kind == ChangeDelete)
+}
+
+// readIndex reads every index event of the entity (at most indexPageMax).
+func (c *Client) readIndex(ctx context.Context, ref EntityRef, timeline int) ([]indexEvent, error) {
+	if c.Tenant == "" {
+		return nil, ErrTenantRequired
+	}
+	var resp struct {
+		Events []indexEvent `json:"events"`
+	}
+	path := fmt.Sprintf("/api/v1/ts/events/latest?timeline=%d&dims=%d&n=%d", timeline, ref.ID, indexPageMax)
+	if _, err := c.doJSON(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Events, nil
+}
+
+// indexSeq reads the entity's index events as a version-ordered sequence. ok is
+// false when the index gives no usable answer: it cannot be read, it has no
+// events for the entity, it returned a full page (so it may be incomplete), or
+// it has two events for one version.
+func (c *Client) indexSeq(ctx context.Context, ref EntityRef, timeline int) ([]asOfEntry, bool) {
+	events, err := c.readIndex(ctx, ref, timeline)
+	if err != nil || len(events) == 0 || len(events) >= indexPageMax {
+		return nil, false
+	}
+	seen := map[int]bool{}
+	seq := make([]asOfEntry, 0, len(events))
+	for _, e := range events {
+		if len(e.Dims) != 2 || e.Dims[0] != uint64(ref.ID) {
+			return nil, false
+		}
+		v := int(e.Dims[1])
+		if v < 1 || v > MaxVersion || seen[v] {
+			return nil, false
+		}
+		seen[v] = true
+		at, err := time.Parse(time.RFC3339Nano, e.Time)
+		if err != nil {
+			return nil, false
+		}
+		kind := ChangeSave
+		if len(e.Nums) > 0 && e.Nums[0] != 0 {
+			kind = ChangeDelete
+		}
+		seq = append(seq, asOfEntry{version: v, kind: kind, at: at})
+	}
+	sort.Slice(seq, func(i, j int) bool { return seq[i].version < seq[j].version })
+	return seq, true
+}
+
+// indexComplete checks that the index leaves out no version of the history: no
+// history row before its first event, none in a gap between events, and none
+// after its last. Normally the events are contiguous, so this costs two row
+// reads. More than maxGapChecks reads in gaps and the index is not trusted.
+func (c *Client) indexComplete(ctx context.Context, ref EntityRef, seq []asOfEntry) bool {
+	absent := func(v int) bool {
+		if v < 1 || v > MaxVersion {
+			return true
+		}
+		_, err := c.getHistoryRow(ctx, ref, v)
+		return errors.Is(err, ErrVersionNotFound)
+	}
+	if !absent(seq[0].version - 1) {
+		return false
+	}
+	checks := 0
+	for i := 1; i < len(seq); i++ {
+		for v := seq[i-1].version + 1; v < seq[i].version; v++ {
+			checks++
+			if checks > maxGapChecks || !absent(v) {
+				return false
+			}
+		}
+	}
+	return absent(seq[len(seq)-1].version + 1)
+}
+
+// ---- Version index (/ts) ---------------------------------------------------
+//
+// The index is optional. For an entity type with an index, every history row
+// written by Save, Restore and Delete is accompanied by one /ts event with the
+// dimensions (entity id, version), the same instant as the row's saved_at, and
+// one number (1 for a tombstone, 0 otherwise). AsOf then finds an entity's
+// versions with one query on that entity's events instead of scanning the
+// whole history type. The history rows stay the authority: the index is derived
+// from them, checked against them, and can be rebuilt from them.
+
+// ErrTenantRequired is returned when a version index is used without
+// Client.Tenant: xolu serves /ts only on tenant routes.
+var ErrTenantRequired = errors.New("xoluver: the version index needs Client.Tenant, because xolu serves /ts only on tenant routes")
+
+// ErrNoIndex is returned by CheckIndex and RebuildIndex for an entity type with
+// no version index configured.
+var ErrNoIndex = errors.New("xoluver: no version index is configured for this entity type; call UseTimeIndex")
+
+// ErrTenantOQL is returned by reads that scan the history type with OQL when
+// Client.Tenant is set. In xolu v0.30.38 the OQL validator checks entity names
+// against the default store, so on tenant routes it answers "entity does not
+// exist" for entities that do, and an empty answer would be wrong. ListVersions,
+// CheckHistory and the AsOf scan therefore fail on tenant routes; AsOf can be
+// served from the version index, and CheckIndex and RebuildIndex read history
+// by id instead.
+var ErrTenantOQL = errors.New("xoluver: xolu cannot run OQL over tenant entities (its query validator checks the default store), so this read is unavailable on tenant routes")
+
+// ErrIndexNotReady is returned by Save, Restore and Delete when the version
+// index of the entity's type is configured but xolu has no such timeline (or the
+// tenant has no timeseries). Nothing was written. Call DefineTimeIndex.
+type ErrIndexNotReady struct {
+	Type     string
+	Timeline int
+}
+
+func (e *ErrIndexNotReady) Error() string {
+	return fmt.Sprintf("xoluver: the version index for %q (timeline %d) is not defined; call DefineTimeIndex first", e.Type, e.Timeline)
+}
+
+// UseTimeIndex makes the client index the versions of entities of typ in the
+// /ts timeline with the given id (1 to 65535). It does not touch the server;
+// DefineTimeIndex creates the timeline. Call it before the client is shared
+// between goroutines. Several types can share one timeline, since the entity id
+// is a dimension, but then the ids must not collide across types: give each
+// type its own timeline.
+func (c *Client) UseTimeIndex(typ string, timeline int) error {
+	if !typeRe.MatchString(typ) || strings.HasSuffix(typ, "_version") {
+		return fmt.Errorf("xoluver: invalid entity type %q", typ)
+	}
+	if timeline < 1 || timeline > 65535 {
+		return fmt.Errorf("xoluver: timeline id %d is outside 1..65535", timeline)
+	}
+	if c.TimeIndex == nil {
+		c.TimeIndex = map[string]int{}
+	}
+	c.TimeIndex[typ] = timeline
+	return nil
+}
+
+// DefineTimeIndex provisions /ts for the client's tenant and defines the
+// timeline: two dimensions (entity id, version) and no expiry. It can be called
+// again; an existing timeline is accepted only if it has those properties,
+// because an index that expires would answer AsOf from a truncated history.
+func (c *Client) DefineTimeIndex(ctx context.Context, timeline int) error {
+	if c.Tenant == "" {
+		return ErrTenantRequired
+	}
+	if timeline < 1 || timeline > 65535 {
+		return fmt.Errorf("xoluver: timeline id %d is outside 1..65535", timeline)
+	}
+	if _, err := c.doJSON(ctx, http.MethodPost, "/api/v1/ts/provision", nil, nil); err != nil {
+		return err
+	}
+	def := map[string]any{"id": timeline, "name": "xoluver_versions", "dims": 2, "retention_days": -1}
+	if _, err := c.doJSON(ctx, http.MethodPost, "/api/v1/ts/tl/def", def, nil); err != nil {
+		return err
+	}
+	dims, retention, err := c.timelineDef(ctx, timeline)
+	if err != nil {
+		return err
+	}
+	if dims != 2 || retention >= 0 {
+		return fmt.Errorf("xoluver: timeline %d has dims=%d and retention_days=%d; the version index needs dims=2 and no expiry (retention_days=-1)", timeline, dims, retention)
+	}
+	return nil
+}
+
+// timelineDef reads a timeline's dimension count and retention.
+func (c *Client) timelineDef(ctx context.Context, timeline int) (dims, retention int, err error) {
+	var d struct {
+		Dims      int `json:"dims"`
+		Retention int `json:"retention_days"`
+	}
+	if _, err = c.doJSON(ctx, http.MethodGet, fmt.Sprintf("/api/v1/ts/tl/%d", timeline), nil, &d); err != nil {
+		return 0, 0, err
+	}
+	return d.Dims, d.Retention, nil
+}
+
+// IndexStats reports how many AsOf calls were answered from the version index
+// and how many left it for the scan, since the client was created.
+func (c *Client) IndexStats() (hits, fallbacks int64) {
+	return atomic.LoadInt64(&c.indexHits), atomic.LoadInt64(&c.indexFallbacks)
+}
+
+// IndexReport compares an entity's index events with its history rows.
+type IndexReport struct {
+	Timeline int
+	Events   int // index events found for the entity
+	// Missing lists versions that have a history row and no index event, as after
+	// the index was enabled on an existing history. RebuildIndex fixes these.
+	Missing []int
+	// Orphans lists versions that have an index event and no history row, as
+	// after a commit whose /ts write was not undone. xolu offers no way to remove
+	// a single event.
+	Orphans []int
+	// Duplicates lists versions with more than one index event.
+	Duplicates []int
+	// Mismatched lists versions whose event disagrees with the row on the time or
+	// on whether it is a tombstone.
+	Mismatched []int
+	// NoExpiry is true when the timeline keeps its events forever. An expiring
+	// timeline silently loses the start of every history.
+	NoExpiry bool
+}
+
+// OK reports whether the index agrees with the history and cannot expire.
+func (r IndexReport) OK() bool {
+	return len(r.Missing) == 0 && len(r.Orphans) == 0 && len(r.Duplicates) == 0 && len(r.Mismatched) == 0 && r.NoExpiry
+}
+
+// CheckIndex compares the entity's index events with its history rows. AsOf
+// checks the index only where its answer depends on it; CheckIndex checks all of
+// it, including every event's time, which AsOf does not re-verify.
+func (c *Client) CheckIndex(ctx context.Context, ref EntityRef) (IndexReport, error) {
+	rep, _, err := c.checkIndex(ctx, ref)
+	return rep, err
+}
+
+func (c *Client) checkIndex(ctx context.Context, ref EntityRef) (IndexReport, map[int]asOfEntry, error) {
+	var rep IndexReport
+	if err := ref.validate(); err != nil {
+		return rep, nil, err
+	}
+	timeline, ok := c.TimeIndex[ref.Type]
+	if !ok {
+		return rep, nil, ErrNoIndex
+	}
+	rep.Timeline = timeline
+	if c.Tenant == "" {
+		return rep, nil, ErrTenantRequired
+	}
+	if _, retention, err := c.timelineDef(ctx, timeline); err != nil {
+		return rep, nil, err
+	} else {
+		rep.NoExpiry = retention < 0
+	}
+	events, err := c.readIndex(ctx, ref, timeline)
+	if err != nil {
+		return rep, nil, err
+	}
+	if len(events) >= indexPageMax {
+		return rep, nil, fmt.Errorf("xoluver: the index holds %d or more events for the entity; CheckIndex reads at most %d", indexPageMax, indexPageMax-1)
+	}
+	rep.Events = len(events)
+	history, err := c.historyForCheck(ctx, ref, events)
+	if err != nil {
+		return rep, nil, err
+	}
+	byVersion := map[int][]indexEvent{}
+	for _, e := range events {
+		if len(e.Dims) == 2 {
+			byVersion[int(e.Dims[1])] = append(byVersion[int(e.Dims[1])], e)
+		}
+	}
+	for v, evs := range byVersion {
+		row, has := history[v]
+		switch {
+		case len(evs) > 1:
+			rep.Duplicates = append(rep.Duplicates, v)
+		case !has:
+			rep.Orphans = append(rep.Orphans, v)
+		default:
+			at, err := time.Parse(time.RFC3339Nano, evs[0].Time)
+			tomb := len(evs[0].Nums) > 0 && evs[0].Nums[0] != 0
+			if err != nil || !at.Equal(row.at) || tomb != (row.kind == ChangeDelete) {
+				rep.Mismatched = append(rep.Mismatched, v)
+			}
+		}
+		if len(evs) > 1 && !has {
+			rep.Orphans = append(rep.Orphans, v)
+		}
+	}
+	for v := range history {
+		if len(byVersion[v]) == 0 {
+			rep.Missing = append(rep.Missing, v)
+		}
+	}
+	for _, list := range [][]int{rep.Missing, rep.Orphans, rep.Duplicates, rep.Mismatched} {
+		sort.Ints(list)
+	}
+	return rep, history, nil
+}
+
+// maxByIDReads bounds how many history rows CheckIndex and RebuildIndex read by
+// id on tenant routes.
+const maxByIDReads = 10000
+
+// historyForCheck reads the entity's history as versions with their times and
+// kinds. With OQL it scans; on tenant routes, where OQL cannot see the
+// entities, it reads rows 1..bound by id, where bound is the larger of the
+// entity's current version and the last version in the index, and then rows
+// past it until the first missing one (which finds the tail of a deleted entity
+// the index lacks). That is one read per version: a maintenance cost, not a
+// per-call one.
+func (c *Client) historyForCheck(ctx context.Context, ref EntityRef, events []indexEvent) (map[int]asOfEntry, error) {
+	history := map[int]asOfEntry{}
+	if c.Tenant == "" {
+		rows, err := c.historyRows(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			v := asInt(r["version"])
+			if asInt(r["id"]) != historyID(ref.ID, v) {
+				continue
+			}
+			at, err := ParseTime(asString(r["saved_at"]))
+			if err != nil {
+				continue // CheckHistory reports unreadable times
+			}
+			history[v] = asOfEntry{version: v, kind: asString(r["change_kind"]), at: at}
+		}
+		return history, nil
+	}
+	bound := 0
+	if _, v, err := c.getEntity(ctx, ref); err == nil {
+		bound = v
+	} else if !errors.Is(err, ErrEntityNotFound) {
+		return nil, err
+	}
+	for _, e := range events {
+		if len(e.Dims) == 2 && int(e.Dims[1]) > bound {
+			bound = int(e.Dims[1])
+		}
+	}
+	if bound > maxByIDReads {
+		return nil, fmt.Errorf("xoluver: reading %d history rows by id exceeds the limit of %d", bound, maxByIDReads)
+	}
+	for v := 1; v <= MaxVersion; v++ {
+		if v > maxByIDReads {
+			return nil, fmt.Errorf("xoluver: the history is longer than the %d rows that can be read by id", maxByIDReads)
+		}
+		row, err := c.getHistoryRow(ctx, ref, v)
+		if errors.Is(err, ErrVersionNotFound) {
+			if v > bound {
+				break // history rows are contiguous: the first missing row past the bound ends them
+			}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		at, perr := ParseTime(asString(row["saved_at"]))
+		if perr != nil {
+			continue
+		}
+		history[v] = asOfEntry{version: v, kind: asString(row["change_kind"]), at: at}
+	}
+	return history, nil
+}
+
+// RebuildIndex writes the index events that are missing for the entity's
+// history rows and returns how many it wrote. It is how an index is created for
+// history that existed before the index was enabled. It does not remove
+// anything: orphans, duplicates and mismatched events are reported by
+// CheckIndex and need an administrator, since xolu removes /ts events only by
+// time range.
+func (c *Client) RebuildIndex(ctx context.Context, ref EntityRef) (written int, err error) {
+	rep, history, err := c.checkIndex(ctx, ref)
+	if err != nil {
+		return 0, err
+	}
+	var batch []commitTS
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		_, err := c.doJSON(ctx, http.MethodPost, "/api/v1/ts/events/batch", map[string]any{"events": batch}, nil)
+		if err == nil {
+			written += len(batch)
+			batch = batch[:0]
+		}
+		return err
+	}
+	for _, v := range rep.Missing {
+		e := history[v]
+		kind := 0.0
+		if e.kind == ChangeDelete {
+			kind = 1
+		}
+		batch = append(batch, commitTS{
+			Timeline: rep.Timeline,
+			Dims:     []uint64{uint64(ref.ID), uint64(v)},
+			Time:     e.at.UTC().Format(time.RFC3339Nano),
+			Nums:     []float64{kind},
+		})
+		if len(batch) == 500 {
+			if err := flush(); err != nil {
+				return written, err
+			}
+		}
+	}
+	return written, flush()
 }
 
 // ---- Labels (/meta) --------------------------------------------------------
@@ -1000,6 +1540,23 @@ type errBody struct {
 	CurrentVersion json.Number `json:"current_version"`
 }
 
+// route maps an API path to the tenant's route when Tenant is set. The path may
+// carry a query string.
+func (c *Client) route(path string) (string, error) {
+	if c.Tenant == "" {
+		return path, nil
+	}
+	if !tenantRe.MatchString(c.Tenant) {
+		return "", fmt.Errorf("xoluver: invalid tenant %q", c.Tenant)
+	}
+	for _, prefix := range []string{"/api/v1/", "/api/v2/"} {
+		if strings.HasPrefix(path, prefix) {
+			return prefix + "tenant/" + c.Tenant + "/" + strings.TrimPrefix(path, prefix), nil
+		}
+	}
+	return path, nil
+}
+
 func (c *Client) doJSON(ctx context.Context, method, path string, in, out any) (int, error) {
 	var rd io.Reader
 	if in != nil {
@@ -1009,7 +1566,11 @@ func (c *Client) doJSON(ctx context.Context, method, path string, in, out any) (
 		}
 		rd = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, rd)
+	route, err := c.route(path)
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+route, rd)
 	if err != nil {
 		return 0, err
 	}
@@ -1054,6 +1615,12 @@ func (c *Client) oql(ctx context.Context, query string) ([]map[string]any, error
 	}
 	if _, err := c.doJSON(ctx, http.MethodPost, "/api/v1/oql/query", map[string]string{"query": query}, &resp); err != nil {
 		if isMissingEntity(err) {
+			if c.Tenant != "" {
+				// On tenant routes xolu's query validator checks entity names
+				// against the default store, so it rejects entities that exist.
+				// "No rows" would be a wrong answer.
+				return nil, ErrTenantOQL
+			}
 			// A history type that has never been written to does not exist
 			// yet (xolu answers 400 XOLU-QL004); for reads that means no rows.
 			return nil, nil

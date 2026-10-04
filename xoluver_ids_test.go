@@ -270,7 +270,7 @@ func TestLostRaceMapsToConflictLive(t *testing.T) {
 	proxy := httputil.NewSingleHostReverseProxy(up)
 	var once int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/commit" && atomic.CompareAndSwapInt32(&once, 0, 1) {
+		if r.URL.Path == apiPath(c0, "/api/v1/commit") && atomic.CompareAndSwapInt32(&once, 0, 1) {
 			// A competing save lands after this client looked, before it commits.
 			if _, err := c0.Save(context.Background(), ref, 1, map[string]any{"n": 99}, SaveOptions{SavedBy: "rival"}); err != nil {
 				t.Errorf("competing save: %v", err)
@@ -281,6 +281,7 @@ func TestLostRaceMapsToConflictLive(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL)
+	c.Tenant = c0.Tenant
 	_, err := c.Save(context.Background(), ref, 1, map[string]any{"n": 2}, SaveOptions{SavedBy: "slow"})
 	var ce *ErrVersionConflict
 	if !errors.As(err, &ce) || ce.Current != 2 {

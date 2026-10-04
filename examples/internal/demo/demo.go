@@ -9,6 +9,7 @@ package demo
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/ha1tch/xoluver"
 )
 
 // BaseURL is XOLU_URL, or http://localhost:9090.
@@ -24,6 +28,51 @@ func BaseURL() string {
 		return strings.TrimRight(u, "/")
 	}
 	return "http://localhost:9090"
+}
+
+// Tenant is XOLU_TENANT: when set, every request goes to that tenant's routes.
+func Tenant() string { return os.Getenv("XOLU_TENANT") }
+
+// NewClient returns an xoluver client for BaseURL and Tenant.
+func NewClient() *xoluver.Client {
+	c := xoluver.New(BaseURL())
+	c.Tenant = Tenant()
+	return c
+}
+
+// UseTenant selects a tenant for the examples that need /ts, unless XOLU_TENANT
+// is already set. /ts is served only on tenant routes.
+func UseTenant(name string) {
+	if Tenant() == "" {
+		os.Setenv("XOLU_TENANT", name)
+	}
+}
+
+// NewIndexedClient returns a tenant client with a fresh version index for
+// entities of type "asset": it defines a timeline (two dimensions, no expiry) and
+// registers it. Each run uses its own timeline, so runs never see each other's
+// events.
+func NewIndexedClient(ctx context.Context) (*xoluver.Client, int) {
+	UseTenant("acme")
+	c := NewClient()
+	timeline := 20000 + int(time.Now().UnixNano()/int64(time.Millisecond)%30000)
+	Must(c.DefineTimeIndex(ctx, timeline))
+	Must(c.UseTimeIndex("asset", timeline))
+	return c, timeline
+}
+
+// route maps an API path to the tenant's route when XOLU_TENANT is set.
+func route(path string) string {
+	t := Tenant()
+	if t == "" {
+		return path
+	}
+	for _, prefix := range []string{"/api/v1/", "/api/v2/"} {
+		if strings.HasPrefix(path, prefix) {
+			return prefix + "tenant/" + t + "/" + strings.TrimPrefix(path, prefix)
+		}
+	}
+	return path
 }
 
 // Must stops the program on an error.
@@ -43,7 +92,7 @@ func Call(method, path string, in, out any) int {
 		Must(err)
 		body = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, BaseURL()+path, body)
+	req, err := http.NewRequest(method, BaseURL()+route(path), body)
 	Must(err)
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")

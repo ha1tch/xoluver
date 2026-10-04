@@ -491,7 +491,7 @@ func TestAdvResponseLostRetryIsSafe(t *testing.T) {
 	proxy := httputil.NewSingleHostReverseProxy(up)
 	var dropped int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/commit" && atomic.CompareAndSwapInt32(&dropped, 0, 1) {
+		if r.URL.Path == apiPath(c0, "/api/v1/commit") && atomic.CompareAndSwapInt32(&dropped, 0, 1) {
 			body, _ := io.ReadAll(r.Body)
 			resp, err := http.Post(c0.BaseURL+r.URL.Path, "application/json", bytes.NewReader(body))
 			if err == nil {
@@ -510,6 +510,7 @@ func TestAdvResponseLostRetryIsSafe(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL)
+	c.Tenant = c0.Tenant
 	ctx := context.Background()
 	typ := uniqueType("rl")
 	id := newEntity(t, c0, typ, map[string]any{"title": "v1"})
@@ -598,7 +599,7 @@ func TestAdvDeleteBetweenCheckAndCommit(t *testing.T) {
 	proxy := httputil.NewSingleHostReverseProxy(up)
 	var once int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/commit" && atomic.CompareAndSwapInt32(&once, 0, 1) {
+		if r.URL.Path == apiPath(c0, "/api/v1/commit") && atomic.CompareAndSwapInt32(&once, 0, 1) {
 			if err := rawDo(t, c0, http.MethodDelete, fmt.Sprintf("/api/v1/%s/%d", typ, id), nil); err != nil {
 				t.Errorf("injected delete: %v", err)
 			}
@@ -608,6 +609,7 @@ func TestAdvDeleteBetweenCheckAndCommit(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL)
+	c.Tenant = c0.Tenant
 	_, err := c.Save(context.Background(), ref, 1, map[string]any{"title": "v2"}, SaveOptions{SavedBy: "u1"})
 	var re *ErrEntityRecreated
 	if !errors.As(err, &re) {
